@@ -1,0 +1,55 @@
+from src.dual_mode_app import ChatNode, DirectoryServer, MeshNetwork
+
+
+def _setup_nodes():
+    server = DirectoryServer()
+    alice = ChatNode("Alice", "alice@example.com", server)
+    bob = ChatNode("Bob", "bob@example.com", server)
+    carol = ChatNode("Carol", "carol@example.com", server)
+    for node in (alice, bob, carol):
+        for other in (alice, bob, carol):
+            if node.code6 != other.code6:
+                node.add_contact(other.record.name, other.code6)
+    return server, alice, bob, carol
+
+
+def test_cloud_send_receive():
+    _, alice, bob, _ = _setup_nodes()
+    message_id = alice.send_cloud(bob.code6, "hello cloud")
+    inbox = bob.poll_cloud()
+
+    assert len(inbox) == 1
+    assert inbox[0]["message_id"] == message_id
+    assert inbox[0]["text"] == "hello cloud"
+
+
+def test_mesh_multi_hop_delivery():
+    _, alice, bob, carol = _setup_nodes()
+    mesh = MeshNetwork()
+    mesh.connect(alice, carol)
+    mesh.connect(carol, bob)
+
+    packet = alice.create_packet(bob.code6, "hello mesh")
+    delivered = mesh.send(
+        alice,
+        packet,
+        {alice.code6: alice, bob.code6: bob, carol.code6: carol},
+    )
+
+    assert delivered is True
+    assert any(msg["text"] == "hello mesh" for msg in bob.inbox)
+
+
+def test_mesh_duplicate_drop():
+    _, alice, bob, carol = _setup_nodes()
+    mesh = MeshNetwork()
+    mesh.connect(alice, carol)
+    mesh.connect(carol, bob)
+
+    packet = alice.create_packet(bob.code6, "one time")
+    nodes = {alice.code6: alice, bob.code6: bob, carol.code6: carol}
+    assert mesh.send(alice, packet, nodes) is True
+    assert mesh.send(alice, packet, nodes) is False
+
+    one_time = [msg for msg in bob.inbox if msg["text"] == "one time"]
+    assert len(one_time) == 1

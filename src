@@ -1,0 +1,280 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+import json
+import os
+import random
+from typing import Dict, List, Optional, Set
+from uuid import uuid4
+
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+
+@dataclass
+class UserRecord:
+    name: str
+    email: str
+    code6: str
+    private_key: x25519.X25519PrivateKey
+    public_key: bytes
+
+
+@dataclass
+class Contact:
+    alias: str
+    code6: str
+    public_key: bytes
+
+
+@dataclass
+class Packet:
+    message_id: str
+    sender_code: str
+    recipient_code: str
+    ciphertext: bytes
+    nonce: bytes
+    ttl: int
+    created_at: datetime
+    signature: str
+
+
+class DirectoryServer:
+    """Centralized identity + public key directory + cloud relay queue."""
+
+    def __init__(self) -> None:
+        self.users: Dict[str, Dict[str, str | bytes]] = {}
+        self.email_to_code: Dict[str, str] = {}
+        self.cloud_queues: Dict[str, List[Packet]] = {}
+
+    def signup(self, name: str, email: str, public_key: bytes) -> str:
+        if email in self.email_to_code:
+            return self.email_to_code[email]
+
+        while True:
+            code = f"{random.randint(0, 999999):06d}"
+            if code not in self.users:
+                break
+
+        self.users[code] = {
+            "name": name,
+            "email": email,
+            "public_key": public_key,
+        }
+        self.email_to_code[email] = code
+        self.cloud_queues[code] = []
+        return code
+
+    def get_public_key(self, code6: str) -> Optional[bytes]:
+        user = self.users.get(code6)
+        if not user:
+            return None
+        return user["public_key"]  # type: ignore[return-value]
+
+    def send_cloud(self, packet: Packet) -> None:
+        if packet.recipient_code not in self.cloud_queues:
+            raise ValueError("Recipient not found in directory")
+        self.cloud_queues[packet.recipient_code].append(packet)
+
+    def receive_cloud(self, recipient_code: str) -> List[Packet]:
+        queue = self.cloud_queues.get(recipient_code, [])
+        self.cloud_queues[recipient_code] = []
+        return queue
+
+
+def _derive_shared_key(private_key: x25519.X25519PrivateKey, peer_public_key: bytes) -> bytes:
+    peer = x25519.X25519PublicKey.from_public_bytes(peer_public_key)
+    shared_secret = private_key.exchange(peer)
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=b"dual-mode-chat",
+    ).derive(shared_secret)
+
+
+def encrypt_for_peer(
+    sender_private_key: x25519.X25519PrivateKey,
+    recipient_public_key: bytes,
+    payload: dict,
+) -> tuple[bytes, bytes]:
+    key = _derive_shared_key(sender_private_key, recipient_public_key)
+    nonce = os.urandom(12)
+    cipher = ChaCha20Poly1305(key)
+    plaintext = json.dumps(payload).encode("utf-8")
+    ciphertext = cipher.encrypt(nonce, plaintext, None)
+    return ciphertext, nonce
+
+
+def decrypt_from_peer(
+    recipient_private_key: x25519.X25519PrivateKey,
+    sender_public_key: bytes,
+    ciphertext: bytes,
+    nonce: bytes,
+) -> dict:
+    key = _derive_shared_key(recipient_private_key, sender_public_key)
+    cipher = ChaCha20Poly1305(key)
+    plaintext = cipher.decrypt(nonce, ciphertext, None)
+    return json.loads(plaintext.decode("utf-8"))
+
+
+class ChatNode:
+    def __init__(self, name: str, email: str, server: DirectoryServer) -> None:
+        self.server = server
+        self.private_key = x25519.X25519PrivateKey.generate()
+        self.public_key = self.private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        self.code6 = server.signup(name=name, email=email, public_key=self.public_key)
+        self.record = UserRecord(
+            name=name,
+            email=email,
+            code6=self.code6,
+            private_key=self.private_key,
+            public_key=self.public_key,
+        )
+        self.contacts: Dict[str, Contact] = {}
+        self.inbox: List[dict] = []
+        self.seen_message_ids: Set[str] = set()
+        self.mesh_cache: Dict[str, datetime] = {}
+
+    def add_contact(self, alias: str, code6: str) -> None:
+        public_key = self.server.get_public_key(code6)
+        if not public_key:
+            raise ValueError("Unknown contact code")
+        self.contacts[code6] = Contact(alias=alias, code6=code6, public_key=public_key)
+
+    def create_packet(self, to_code: str, text: str, ttl: int = 4) -> Packet:
+        if to_code not in self.contacts:
+            raise ValueError("Contact not found")
+
+        message_id = str(uuid4())
+        payload = {
+            "message_id": message_id,
+            "from": self.code6,
+            "to": to_code,
+            "text": text,
+            "sent_at": datetime.utcnow().isoformat(),
+        }
+        ciphertext, nonce = encrypt_for_peer(
+            sender_private_key=self.private_key,
+            recipient_public_key=self.contacts[to_code].public_key,
+            payload=payload,
+        )
+        return Packet(
+            message_id=message_id,
+            sender_code=self.code6,
+            recipient_code=to_code,
+            ciphertext=ciphertext,
+            nonce=nonce,
+            ttl=ttl,
+            created_at=datetime.utcnow(),
+            signature=f"sig:{self.code6}:{message_id}",
+        )
+
+    def send_cloud(self, to_code: str, text: str) -> str:
+        packet = self.create_packet(to_code, text)
+        self.server.send_cloud(packet)
+        return packet.message_id
+
+    def poll_cloud(self) -> List[dict]:
+        packets = self.server.receive_cloud(self.code6)
+        decoded: List[dict] = []
+        for packet in packets:
+            sender_key = self.server.get_public_key(packet.sender_code)
+            if sender_key is None:
+                continue
+            payload = decrypt_from_peer(self.private_key, sender_key, packet.ciphertext, packet.nonce)
+            decoded.append(payload)
+            self.inbox.append(payload)
+        return decoded
+
+    def receive_mesh(self, packet: Packet, now: datetime) -> bool:
+        if packet.message_id in self.seen_message_ids:
+            return False
+
+        self.seen_message_ids.add(packet.message_id)
+
+        if packet.recipient_code == self.code6:
+            sender_key = self.server.get_public_key(packet.sender_code)
+            if sender_key is None:
+                return True
+            payload = decrypt_from_peer(self.private_key, sender_key, packet.ciphertext, packet.nonce)
+            self.inbox.append(payload)
+            return True
+
+        self.mesh_cache[packet.message_id] = now + timedelta(seconds=5)
+        return False
+
+    def cleanup_mesh_cache(self, now: datetime) -> None:
+        expired = [msg_id for msg_id, exp in self.mesh_cache.items() if exp <= now]
+        for msg_id in expired:
+            del self.mesh_cache[msg_id]
+
+
+class MeshNetwork:
+    def __init__(self) -> None:
+        self.links: Dict[str, Set[str]] = {}
+
+    def connect(self, a: ChatNode, b: ChatNode) -> None:
+        self.links.setdefault(a.code6, set()).add(b.code6)
+        self.links.setdefault(b.code6, set()).add(a.code6)
+
+    def send(self, sender: ChatNode, packet: Packet, nodes: Dict[str, ChatNode]) -> bool:
+        frontier: List[tuple[str, int]] = [(sender.code6, packet.ttl)]
+        visited: Set[str] = {sender.code6}
+        now = datetime.utcnow()
+
+        while frontier:
+            code, ttl = frontier.pop(0)
+            if ttl <= 0:
+                continue
+
+            for neighbor in self.links.get(code, set()):
+                if neighbor in visited:
+                    continue
+                visited.add(neighbor)
+                delivered = nodes[neighbor].receive_mesh(packet, now)
+                if delivered:
+                    return True
+                frontier.append((neighbor, ttl - 1))
+
+        return False
+
+
+def demo() -> None:
+    print("Starting dual-mode encrypted messenger demo...")
+    server = DirectoryServer()
+    mesh = MeshNetwork()
+
+    alice = ChatNode("Alice", "alice@example.com", server)
+    bob = ChatNode("Bob", "bob@example.com", server)
+    carol = ChatNode("Carol", "carol@example.com", server)
+
+    for node in (alice, bob, carol):
+        for other in (alice, bob, carol):
+            if node.code6 != other.code6:
+                node.add_contact(alias=other.record.name, code6=other.code6)
+
+    print(f"Alice code: {alice.code6}")
+    print(f"Bob code: {bob.code6}")
+    print(f"Carol code: {carol.code6}")
+
+    cloud_id = alice.send_cloud(bob.code6, "Hello Bob (cloud mode)")
+    cloud_messages = bob.poll_cloud()
+    print(f"Cloud delivery message_id={cloud_id}, inbox={cloud_messages}")
+
+    mesh.connect(alice, carol)
+    mesh.connect(carol, bob)
+    mesh_packet = alice.create_packet(bob.code6, "Hello Bob (mesh via Carol)")
+    ok = mesh.send(alice, mesh_packet, {alice.code6: alice, bob.code6: bob, carol.code6: carol})
+    print(f"Mesh delivered: {ok}")
+    print(f"Bob inbox size: {len(bob.inbox)}")
+
+
+if __name__ == "__main__":
+    demo()
